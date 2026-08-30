@@ -93,7 +93,57 @@ is fully consumed before being overwritten.
 
 ---
 
-## 3. Approach
+## 3. Problem analysis: where the reference loses time
+
+Optimization without a defect list is guesswork. Before writing any kernel we
+read the reference line by line and enumerated what it spends time on that the
+mathematics does not require. Each entry maps to exactly one countermeasure --
+deliberately one-to-one, so every optimization is traceable to an observed
+defect rather than adopted because it is a known technique.
+
+The reference attention computes, per layer:
+
+```
+scores = matmul(q, k.transpose(-2,-1)) * scale      # [B,H,S,S] allocated
+scores = scores.masked_fill(causal_mask, -inf)      # half of it discarded
+probs  = softmax(scores.float(), -1).to(dtype)      # [B,H,S,S] AGAIN, fp32
+context = matmul(probs, v)
+```
+
+Two full `[B,H,S,S]` tensors are live at once -- the scores in the model dtype
+and the fp32 copy the stable softmax requires -- and the cost is quadratic in
+sequence length:
+
+| Shape | `[B,H,S,S]` elements | Both copies, fp32 | Consequence |
+|---|---|---|---|
+| #1 (S=128) | 4.2 M | 34 MB | fits, but wasteful |
+| #13 (S=1024) | 268 M | 2.1 GB | dominates the layer |
+| #14 (S=100000) | 5.1 T | ~20 TB | cannot be allocated at all |
+
+### Defect-to-solution map
+
+| # | Defect in the reference | Why it costs | Countermeasure |
+|---|---|---|---|
+| D1 | `[B,H,S,S]` materialized, then again in fp32 for softmax | Quadratic memory; at S=100000 it exceeds any GPU by orders of magnitude | Fused SDPA — never forms the matrix |
+| D2 | Full score matrix computed, then half overwritten with `-inf` | ~50% of attention arithmetic performed and discarded | `is_causal=True` — masked half never computed |
+| D3 | Padding mask applied even where it cannot change the result | A mask tensor demotes SDPA and blocks graph capture | Prefix-mask elision, after proving the mask is a no-op |
+| D4 | Q, K, V are three separate `[d,d]` GEMMs | Three launches, three suboptimal GEMM shapes | Fused QKV — one `[3d,d]` GEMM |
+| D5 | Every sublayer boundary is a separate full pass; the dtype cast does no arithmetic | Bandwidth-bound work scaling with depth, not useful FLOPs | Triton kernel fusing residual add + LayerNorm + cast |
+| D6 | FFN intermediate written, re-read for GELU, written again | Three passes over `[B,S,ffn]` for one activation | cuBLASLt GEMM+GELU epilogue — written once |
+| D7 | Small shapes issue ~60 launches for ~0.13 GFLOP | GPU idles on host submission; arithmetic is not the bottleneck | CUDA-graph capture — one replay |
+| D8 | Each layer re-reads the whole activation from HBM | At B=10000 nothing stays resident between layers | Slice-through-the-stack — a slice stays L2-resident |
+| D9 | Everything runs in fp32 | Tensor cores underused; SDPA's flash backend refuses fp32 | Measured per-shape mixed precision, fp32 residual |
+
+Three things follow. Only **D9 is a precision trade**; the other eight are pure
+waste removal costing no accuracy. **D1 alone changes what is possible** rather
+than what is fast -- it is the difference between shape #14 running and not.
+And D5–D8 are bandwidth or launch-overhead defects, which is why the largest
+speedups appear on the *smallest* shapes: those are the ones where arithmetic
+was never the bottleneck.
+
+---
+
+## 4. Approach
 
 ### The core decision: measure, don't hardcode
 
@@ -149,7 +199,7 @@ floor on shape #7 is about one part in twenty of headroom, not one in two.
 
 ---
 
-## 4. Ablation study — what the fusions are worth
+## 5. Ablation study — what the fusions are worth
 
 Measured on the shipping code. Modes are **interleaved per shape** rather than
 run as two separate sweeps: GPU clocks drift over a multi-minute run, so two
@@ -193,7 +243,7 @@ arithmetic.
 
 ---
 
-## 5. AI-assisted development
+## 6. AI-assisted development
 
 Built with **Claude Code (Claude Opus 5)** in VS Code. The value was not code
 generation — it was **measurement-driven debugging**, catching four defects that
@@ -256,7 +306,7 @@ fixes were themselves wrong on the first attempt and were caught by re-measuring
 
 ---
 
-## 6. Reproducing
+## 7. Reproducing
 
 ```bash
 python run_all_shapes.py                        # 13/14 PASS, ~15 min
