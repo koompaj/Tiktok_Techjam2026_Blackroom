@@ -47,11 +47,11 @@ itself is the cost.
    budget for nothing, so a fused path using it would not be acceptable here.
 
 Both fusions are *offered*, never assumed. `optimized_transformer` verifies
-them numerically against the eager path (`verify_add_norm_cast`) and adopts
-them only when they also measure faster on the real shape -- see `_fusion_pays`
-there. Every entry point degrades to `None` (meaning "caller should use the
-eager path") rather than raising, so a missing Triton, an unsupported width, a
-non-contiguous input or a CPU tensor all simply turn the fusion off.
+them numerically against the eager path before use -- `verify_add_norm_cast`
+here, plus a whole-stack check in `_fusion_pays` there. Every entry point
+degrades to `None` (meaning "caller should use the eager path") rather than
+raising, so a missing Triton, an unsupported width, a non-contiguous input or a
+CPU tensor all simply turn the fusion off.
 
 Nothing here is tuned to any benchmark shape. The one launch parameter that
 must be chosen, `num_warps`, follows the conventional block-size formula.
@@ -65,7 +65,6 @@ import torch
 import torch.nn.functional as F
 
 __all__ = [
-    "triton_available",
     "addmm_activation_available",
     "add_norm_cast",
     "linear_gelu",
@@ -98,31 +97,21 @@ _MAX_FUSED_WIDTH = 8192
 # How far the fused result may sit from the eager one before the kernel is
 # rejected as *wrong*. This is not an accuracy/speed trade: the fusion computes
 # the same mathematics with the same fp32 statistics, so the two differ only by
-# reduction order -- rounding-level, on the order of 1e-7 relative. A budget of
-# 5% of the task's absolute tolerance is thus about four orders of magnitude
-# looser than the expected difference. It is sized to catch a miscompiled or
-# miswritten kernel, not to license a less accurate one.
+# reduction order. It is sized to catch a miscompiled or miswritten kernel, not
+# to license a less accurate one.
 _VERIFY_DIFF_FRACTION = 0.05
 
-# ...but that reasoning holds only in fp32. The comparison is made on tensors
-# already stored in `compute_dtype`, and fp16 quantizes to steps of ~9.77e-4
-# near 1.0 -- an order of magnitude *coarser* than the 1e-4 budget above. Two
-# results that agree perfectly in fp32 therefore land either bit-identical or a
-# full step apart, with nothing in between, so a fixed absolute budget below one
-# step can only ever pass an exactly-equal result. A reduction-order difference
-# of one ULP -- normal, harmless, and what the kernel actually produces -- then
-# reads as a broken kernel.
-#
-# So the allowance carries a term proportional to the storage step. Two steps is
-# still ~100x tighter than anything a genuinely miswritten kernel produces (bad
-# statistics or bad indexing miss by 0.1 to 10, not by 1e-3), so this keeps the
-# check's purpose intact rather than loosening it into a rubber stamp. In fp32
-# the term is ~1e-7 and the budget above dominates, leaving that path unchanged.
+# The comparison is made on tensors already stored in `compute_dtype`, and fp16
+# quantizes to steps of ~9.8e-4 near 1.0 -- coarser than the absolute budget
+# above. Two results that agree perfectly in fp32 therefore land either
+# bit-identical or a full step apart with nothing in between, so an absolute
+# budget below one step can only ever pass an exactly-equal result, and a
+# one-ULP reduction-order difference reads as a broken kernel. The allowance
+# below carries a term proportional to the storage step for that reason. Two
+# steps stays ~100x tighter than anything a miswritten kernel produces (bad
+# statistics or bad indexing miss by 0.1 to 10, not by 1e-3); in fp32 the term
+# is ~1e-7 and the budget above dominates.
 _VERIFY_ULP_SLACK = 2.0
-
-
-def triton_available() -> bool:
-    return _HAVE_TRITON
 
 
 def addmm_activation_available() -> bool:

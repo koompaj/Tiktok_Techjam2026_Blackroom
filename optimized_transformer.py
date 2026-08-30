@@ -67,12 +67,11 @@ Where the speed comes from
 
 9. **One host sync per distinct mask, not per call.** `mask.all()` drains the
    CUDA queue and is illegal during graph capture, so every mask property is
-   resolved once per mask tensor and cached. This is emphatically not "no
-   host syncs on the hot path", which an earlier version of this file
-   claimed: `_mask_plan` syncs the first time it sees any given mask, and the
-   harness's accuracy phase builds a fresh mask for every trial, so it syncs
-   once per trial there. What it does avoid is a sync per *call* -- the
-   timing loop reuses one mask, so the steady-state timed path has none.
+   resolved once per mask tensor and cached. Note this is a sync per *mask*,
+   not none at all: `_mask_plan` syncs the first time it sees any given mask,
+   and the harness's accuracy phase builds a fresh mask per trial, so it syncs
+   once per trial there. The timing loop reuses one mask, so the steady-state
+   timed path has none.
 
 10. **Fused residual + LayerNorm + narrowing.** In mixed precision each
     sublayer boundary was three full passes over the activation -- an in-place
@@ -134,20 +133,17 @@ comparable official shape structures (seed 1234, one trial each):
     fp16 everywhere              6-8e-3    FAILS: near-zero elements miss both
     bf16 GEMMs + fp32 residual   1.0e-2    FAILS outright
 
-Two things in that table were previously stated wrongly and are worth being
-explicit about:
+Two properties of that table are worth being explicit about:
 
-* The fp32 path is **not bit-for-bit** with the baseline, and an earlier version
-  of this docstring claimed it left the non-selected shapes "bit-for-bit". It
-  does not and cannot: fusing Q/K/V into one GEMM changes the TF32 accumulation
-  order, and SDPA computes an online softmax rather than the baseline's explicit
-  one. Shape #1 measures 9.4e-4 on the fp32 path, not 0.
+* The fp32 path is **not bit-for-bit** with the baseline, and cannot be: fusing
+  Q/K/V into one GEMM changes the TF32 accumulation order, and SDPA computes an
+  online softmax rather than the baseline's explicit one. Shape #1 measures
+  9.4e-4 on the fp32 path, not 0.
 
-* The fp16 row was previously quoted as "1.3e-3, PASS, 1.5x under the floor".
-  The margin is real but thinner than that: the shipped sweep measured 1.81e-3
-  on shape #6 (1.10x under the floor), and the per-shape probe above measures
-  1.88e-3 on shape #7 (1.06x). fp16 does pass every comparable shape, but it
-  passes with roughly one part in twenty to spare, not one in two.
+* The fp16 margin is real but thin. The sweep measured 1.81e-3 on shape #6
+  (1.10x under the floor) and the per-shape probe measures 1.88e-3 on shape #7
+  (1.06x). fp16 passes every comparable shape, but with roughly one part in
+  twenty to spare, not one in two.
 
 So the residual stream and every LayerNorm stay in fp32 (`accum_dtype`) while
 the projections and attention run in fp16 (`compute_dtype`). This is not
@@ -231,22 +227,13 @@ Ablation toggles
                              also settable per-instance as `model.atol`
     TJ_DISABLE_FUSED_QKV=1   separate q/k/v projections instead of one GEMM
     TJ_DISABLE_FUSION=1      never fuse residual+LayerNorm+cast or GEMM+GELU;
-                             both are otherwise verified and then measured
-                             per shape (see `_fusion_pays`)
-    TJ_FORCE_FUSION=1        adopt the fusions whenever they are *correct*,
-                             without requiring them to measure faster. The
-                             correctness gate still applies. For ablation: it
-                             separates "measured and rejected" from "never
-                             ran", which the `fusion` column cannot otherwise
-                             distinguish
+                             both are otherwise verified per shape before use
+                             (see `_fusion_pays`)
     TJ_DISABLE_FUSED_NORM=1  only disable the Triton residual+LayerNorm+cast
                              kernel, keeping the GEMM+GELU epilogue
     TJ_DISABLE_GELU_EPILOGUE=1
                              only disable the cuBLASLt GEMM+GELU epilogue,
                              keeping the Triton norm fusion
-    TJ_STREAMS=<int>         run independent batch slices concurrently on this
-                             many CUDA streams (default 1 = sequential). See
-                             `_forward_batched`; experimental, opt-in.
     TJ_DISABLE_SDPA=1        explicit matmul + fp32 softmax instead of SDPA
     TJ_DISABLE_GRAPH=1       never capture a CUDA graph
     TJ_DISABLE_ELISION=1     always build an explicit mask when padding exists
@@ -302,10 +289,6 @@ except ImportError:  # fused_kernels.py not shipped alongside this module
     # are the ones this module used before the fusions existed, so what is lost
     # is speed on some shapes, never correctness.
     class _NoFusedKernels:
-        @staticmethod
-        def triton_available() -> bool:
-            return False
-
         @staticmethod
         def addmm_activation_available() -> bool:
             return False
@@ -586,42 +569,6 @@ _CALIBRATION_FREE_MULTIPLE = 6.0
 # run-to-run jitter on an already-warm kernel.
 _PRECISION_SPEED_MARGIN = 1.02
 
-# RETIRED. The fusions used to have to prove themselves faster by this margin
-# before being adopted. They no longer face a speed gate at all, and the
-# constant is kept only to document why -- the reasoning is the useful part.
-#
-# A five-mode ablation over the 12 runnable shapes (all but #6 and #14, modes
-# interleaved per shape so clock drift is common to all of them):
-#
-#     fusion forced on   16.687 ms total   1.29x
-#     prove-it-faster    17.834 ms total   1.20x
-#     fusion off         21.468 ms total   1.00x
-#
-# Forcing beat "off" on 12 shapes out of 12, so every rejection the gate made
-# cost throughput -- 41-57% of the available speedup on #1, #9, #10 and #12.
-#
-# The first attempt at a fix inverted the gate (adopt unless *demonstrably*
-# slower). It changed essentially nothing: 15.503 vs 15.456 ms over the six
-# worst shapes, with #9 and #12 still refusing on all three runs. That ruled
-# out the threshold's direction and its size as the cause.
-#
-# The actual cause is that the measurement does not describe the path that
-# ships. `_fusion_pays` times the *eager* fused and unfused paths, but half the
-# suite then runs under CUDA-graph capture, where the launch overhead the
-# fusion removes has already been eliminated by the capture and the remaining
-# tradeoff is a different one. On #9 the eager comparison says fused is 18%
-# slower (1.09 vs 0.92 ms) while the captured end-to-end result says fused is
-# 34% faster (0.48 vs 0.73 ms). Both numbers are real; they are answers to
-# different questions, and only the second one is the question being asked.
-#
-# Gating on a non-predictive proxy is worse than not gating, so the gate is
-# gone. Correctness is still verified per shape (`_verify_fusion` and the
-# whole-stack check in `_fusion_pays`), and `TJ_DISABLE_FUSION`,
-# `TJ_DISABLE_FUSED_NORM` and `TJ_DISABLE_GELU_EPILOGUE` remain for ablation.
-# Making the timing predictive would mean calibrating under capture, which is a
-# larger change than the one this constant used to guard.
-_FUSION_SPEED_MARGIN = 1.02  # unused; see above
-
 # How far the whole-stack fused result may sit from the unfused one before the
 # fusion is rejected. Still a correctness check rather than an accuracy budget,
 # but the "~1e-6, differs only by reduction order" reasoning this constant used
@@ -688,15 +635,10 @@ def _mask_identity(mask: torch.Tensor) -> int:
     because `_mask_plan`'s cache always stores a strong reference to the mask
     alongside its verdict (see the cache entry there): while an entry is
     live, the object named by its key cannot be freed, so nothing can recycle
-    that id out from under it. An earlier version of this function warned
-    that "id() can be recycled" and built a heavier key out of the storage
-    pointer, shape, stride and dtype to compensate -- paying for a
-    `mask.stride()` read and three more comparisons on every lookup to guard
-    against a case the strong reference already rules out. The *original*
-    implementation predating that rewrite never used `id()` at all: it held
-    the tensor and compared it with `is`, which is exact and cheaper, and is
-    what this restores -- `_mask_plan` still checks `entry[0] is mask` on
-    every hit, so identity is verified, not merely assumed.
+    that id out from under it. Identity is verified rather than assumed:
+    `_mask_plan` checks `entry[0] is mask` on every hit, which is exact and
+    cheaper than rebuilding a key from the storage pointer, shape, stride and
+    dtype to guard a case the strong reference already rules out.
 
     What this deliberately does NOT include is `Tensor._version`, the obvious
     guard against in-place mutation of a cached mask. It raises
@@ -1244,16 +1186,14 @@ class OptimizedTransformerMixin:
         This has to mirror the harness's own `benchmark_once`
         (`torch_transformer_benchmark.py`), which submits every iteration before
         a single `torch.cuda.synchronize()` rather than syncing after each one.
-        That is not a cosmetic difference. An earlier version of this function
-        synchronized inside the loop, which drains the launch queue and lets the
-        host catch back up before the next call is submitted -- so a shape whose
-        host-side submission cannot keep pace with the GPU (a "launch-bound"
-        shape, exactly the kind CUDA-graph capture exists to help) measured
-        artificially cheap in isolation. Under the harness's real back-to-back
-        loop the host falls behind and per-call latency is measurably higher.
-        Shape #13 lost its graph to precisely this: syncing every call measured
-        6.77 ms eager; the harness's actual repeats-in-a-row loop measures
-        10.92 ms. `_capture_pays` below has to time graph replay with the same
+        That is not a cosmetic difference. Synchronizing inside the loop drains
+        the launch queue and lets the host catch back up before the next call is
+        submitted, so a shape whose host-side submission cannot keep pace with
+        the GPU -- a "launch-bound" shape, exactly the kind capture exists to
+        help -- measures artificially cheap in isolation. Under the harness's
+        real back-to-back loop the host falls behind and per-call latency is
+        measurably higher: on shape #13, 6.77 ms syncing per call against
+        10.92 ms for the repeats-in-a-row loop. `_capture_pays` below has to time graph replay with the same
         submission pattern, or the two numbers it compares are biased
         differently and the comparison is meaningless.
 
@@ -1318,9 +1258,8 @@ class OptimizedTransformerMixin:
     ) -> torch.Tensor:
         """Elementwise size of our own fp32 path's TF32 rounding.
 
-        Named `..._estimate` on purpose, after being called plain `_tf32_noise`
-        and treated as a bound in an earlier version of this file. It is not
-        an upper bound on `|r32 - truth|`: both the TF32 run and the
+        Named `..._estimate` on purpose: it is not an upper bound on
+        `|r32 - truth|`. Both the TF32 run and the
         TF32-disabled run below go through *our* path, so every algorithmic
         deviation from the baseline -- SDPA's online softmax, the fused-QKV
         accumulation order -- is present in both and cancels out of the
@@ -1531,10 +1470,9 @@ class OptimizedTransformerMixin:
         ~34 MB to ~620 MB selected exactly the same shapes: the signature of a
         constant that was never measured.
 
-        It cannot be *predicted* either, which an earlier version of this
-        function learned the hard way. That version estimated the replay as
-        `gpu_ms + 2 * clone_ms` and compared it against the eager `wall_ms`.
-        The flaw is that `gpu_ms` is event-to-event time on the stream, so it
+        It cannot be *predicted* either. Estimating the replay as
+        `gpu_ms + 2 * clone_ms` and comparing against the eager `wall_ms` fails
+        because `gpu_ms` is event-to-event time on the stream, so it
         spans the idle gaps where a starved GPU sat waiting for the host --
         and those gaps are exactly what capture deletes. The estimate is
         therefore inflated in precise proportion to how much capture would
@@ -1594,9 +1532,9 @@ class OptimizedTransformerMixin:
             # One replay to settle the pool, then time N replays back-to-back
             # with a single synchronize() at the end -- the identical pattern
             # `_time_forward` now uses for the eager side (see its docstring).
-            # Timing replay call-by-call with a sync after each one, as an
-            # earlier version did, hides exactly the effect this comparison
-            # exists to catch: replay pays two full-size device-to-device
+            # Timing replay call-by-call with a sync after each one would hide
+            # exactly the effect this comparison exists to catch: replay pays
+            # two full-size device-to-device
             # copies per call (`static_x.copy_` in, `static_out.clone()` out),
             # and under sustained back-to-back submission those compete with
             # the eager path's own queueing pressure. Timing both sides the
@@ -1726,18 +1664,12 @@ class OptimizedTransformerMixin:
         _rtol, atol = self._tolerance()
         if not diff <= _FUSION_DIFF_FRACTION * atol:
             return False, unfused_ms
-        # `TJ_FORCE_FUSION` skips the *speed* gate below and nothing else. The
-        # correctness check above still runs and can still refuse: adopting a
-        # slower-but-correct path costs throughput and is a legitimate thing to
-        # ask for while measuring, whereas adopting an incorrect one costs the
-        # answer and is never what anyone wants. It exists because "the fusion
-        # measured 1% faster" and "the fusion never ran" are indistinguishable
-        # in the `fusion` column otherwise, and telling them apart is the whole
-        # point of an ablation.
-        # No speed gate. `wall` is still measured and still returned, because
-        # `_capture_pays` needs the timing of the path that will actually run --
-        # but it is deliberately not used to decide *whether* to fuse. See
-        # `_FUSION_SPEED_MARGIN` for the measurement that retired that gate.
+        # Correct is the only bar. `wall` is still measured and returned because
+        # `_capture_pays` needs the timing of the path that will actually run,
+        # but it does not decide *whether* to fuse: the fusions remove memory
+        # traffic and launches without adding arithmetic, and a speed gate here
+        # would be comparing eager timings against shapes that go on to run
+        # under graph capture, which is not the same question.
         return True, wall
 
     def _fallback_plan(self, x: torch.Tensor) -> "_ShapePlan":
@@ -2489,15 +2421,6 @@ class OptimizedTransformerMixin:
                 x, stack, attn_mask, zero_mask, plan.is_causal, use_fusion
             )
 
-        streams = self._slice_streams(x, retry_on_oom)
-        if streams:
-            # The streamed path allocates its own output and is opt-in and
-            # experimental; aliasing a destructive write into concurrently
-            # running slices is not something to combine with it untested.
-            return self._forward_sliced_streamed(
-                x, stack, plan, valid_token_mask, slice_size, use_fusion, streams
-            )
-
         # Aliasing, not copying: `x[start:stop] = ...` below writes into the
         # caller's tensor exactly where `output[start:stop] = ...` would have
         # written into a fresh one. Safe because slice `[start:stop]` is fully
@@ -2531,98 +2454,6 @@ class OptimizedTransformerMixin:
                     torch.cuda.empty_cache()
                 continue
             start = stop
-        return output
-
-    def _slice_streams(
-        self, x: torch.Tensor, retry_on_oom: bool
-    ) -> List["torch.cuda.Stream"]:
-        """Side streams to spread independent slices across, or `[]`.
-
-        Batch slices never interact -- row 5 is not read while computing row
-        900 -- so consecutive slices are free to run concurrently, overlapping
-        one slice's memory traffic with another's math. What stops this being
-        unconditionally good is memory: N concurrent slices hold N slices'
-        intermediates at once, and the slice budget was sized on the assumption
-        that only one is live.
-
-        So this is opt-in via `TJ_STREAMS` and off by default. It is also
-        refused during graph capture (`retry_on_oom=False`), where recording
-        cross-stream work would bake this call's stream topology into the graph.
-
-        EXPERIMENTAL. Unlike everything else here it has not been measured, and
-        the sequential path remains the default precisely because a wrong
-        answer from a memory race would be far more expensive than the
-        throughput it might buy.
-        """
-        count = _env_int("TJ_STREAMS", 1)
-        if count <= 1 or not x.is_cuda or not retry_on_oom:
-            return []
-        is_compiling = getattr(torch.compiler, "is_compiling", None)
-        if is_compiling is not None and is_compiling():
-            return []
-        cache = self._cache("_stream_cache", {})
-        key = (str(x.device), count)
-        streams = cache.get(key)
-        if streams is None:
-            streams = [torch.cuda.Stream(device=x.device) for _ in range(count)]
-            cache[key] = streams
-        return streams
-
-    def _forward_sliced_streamed(
-        self,
-        x: torch.Tensor,
-        stack: _StackWeights,
-        plan: _MaskPlan,
-        valid_token_mask: Optional[torch.Tensor],
-        slice_size: int,
-        use_fusion: bool,
-        streams: List["torch.cuda.Stream"],
-    ) -> torch.Tensor:
-        """`_forward_batched`'s slice loop, spread over several CUDA streams.
-
-        Deliberately has no OOM-halving retry. Recovering from an OOM raised on
-        one of several in-flight streams would mean unwinding work already
-        queued on the others; the sequential path is the one that carries that
-        machinery, and a shape that needs it should not be using this one.
-        """
-        batch, seq_len, _ = x.shape
-        output = torch.empty_like(x)
-        current = torch.cuda.current_stream(x.device)
-
-        # `x`, `output` and the mask were allocated on the default stream but
-        # are read and written on the side streams. `record_stream` is what
-        # tells the caching allocator so: without it, a later free on the
-        # default stream could hand those blocks to another allocation while a
-        # side stream is still using them. Tensors allocated *inside*
-        # `_forward_slice` live and die on the stream that made them and need
-        # no such marking.
-        for stream in streams:
-            stream.wait_stream(current)
-            x.record_stream(stream)
-            output.record_stream(stream)
-            if valid_token_mask is not None:
-                valid_token_mask.record_stream(stream)
-
-        for index, start in enumerate(range(0, batch, slice_size)):
-            stop = min(batch, start + slice_size)
-            stream = streams[index % len(streams)]
-            with torch.cuda.stream(stream):
-                attn_mask, zero_mask = self._slice_masks(
-                    plan, valid_token_mask, start, stop, seq_len, x.device
-                )
-                output[start:stop] = self._forward_slice(
-                    x[start:stop],
-                    stack,
-                    attn_mask,
-                    zero_mask,
-                    plan.is_causal,
-                    use_fusion,
-                )
-
-        # The caller continues on the default stream, so it must not observe
-        # `output` before every slice has landed in it.
-        for stream in streams:
-            current.wait_stream(stream)
         return output
 
     # -- CUDA graphs --------------------------------------------------------
@@ -2861,14 +2692,13 @@ class OptimizedTransformerMixin:
         by construction before a single kernel runs: the input reaches us at all
         only because the driver silently backed part of it with system memory.
 
-        In-place output reuse is ruled out by the *contract*, not by arithmetic
-        -- an earlier version of this docstring claimed writing the result into
-        the input "would still need input + output resident", which is simply
-        false: aliasing them needs one buffer, not two, and at fp16 that is
-        6.10 GiB rather than 12.21 GiB, which does fit this card. What forbids
-        it is that `forward` must return a new tensor and the harness reuses one
+        In-place output reuse is ruled out by the *contract*, not by arithmetic.
+        Aliasing needs one buffer rather than two, which at fp16 is 6.10 GiB
+        rather than 12.21 GiB and does fit this card. What forbids it by default
+        is that `forward` must return a new tensor and the harness reuses one
         `x` across every accuracy trial and every timing iteration, so
-        destroying it would corrupt every later call.
+        destroying it would corrupt every later call -- hence
+        `TJ_INPLACE_OUTPUT` for callers that own their input.
 
         What can be improved is the failure. Without this the shape dies several
         layers deep inside the allocator with a traceback that reads like a bug
@@ -2918,11 +2748,10 @@ class OptimizedTransformerMixin:
             "TJ_INPLACE_OUTPUT=1 to alias the output onto the input (halves "
             "this, destroys the input), or TJ_ALLOW_OVERSUBSCRIBE=1 to run it "
             "anyway backed by host memory over PCIe."
-            # Order matters and did not used to match: the format string reads
-            # "%s (%s): the %d ...", so shape and dtype come first and `buffers`
-            # third. With `buffers` passed first, `x.dtype` landed on the `%d`
-            # and this raised TypeError instead of the intended RuntimeError --
-            # turning a legible refusal into a crash inside the refusal.
+            # Order matters: the format reads "%s (%s): the %d ...", so shape
+            # and dtype come first and `buffers` third. Passing `buffers` first
+            # lands `x.dtype` on the `%d` and raises TypeError -- a crash inside
+            # the refusal, instead of the refusal.
             % (
                 tuple(x.shape),
                 x.dtype,
