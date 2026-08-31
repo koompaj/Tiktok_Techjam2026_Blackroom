@@ -86,10 +86,17 @@ over PCIe. The latency is reproducible but it measures paging, not what the shap
 would cost resident. Reported result: *runs to completion, output finite and
 correctly distributed.*
 
-Even reaching that required halving the memory floor. At fp32 the input plus a
-separate output buffer is 24.41 GiB; `--inplace-output` aliases the result onto
-the input, which is safe here because batch rows are independent and each slice
-is fully consumed before being overwritten.
+**fp16 here is mandatory, not a preference.** At fp32 the input plus a separate
+output buffer is 24.41 GiB; `--inplace-output` aliases the result onto the input
+and halves that, but one fp32 buffer is still 12.21 GiB against 11.99 GiB of
+VRAM — fp32 does not fit even aliased. Only fp16 does, which is why
+`run_optimized_only.py` defaults to it. The aliasing is sound because batch rows
+are independent under attention and each slice is fully consumed before being
+overwritten; it is opt-in because it destroys the caller's input.
+
+This is also why `run_all_shapes.py` reports #14 as OOM: the sweep runs fp32,
+where the shape genuinely does not fit. That refusal is the preflight check
+working, not a failure of the optimized path.
 
 ---
 
@@ -199,13 +206,42 @@ floor on shape #7 is about one part in twenty of headroom, not one in two.
 
 ---
 
+### How the two precisions combine
+
+The mixed path is **not** a fallback: fp16 and fp32 run in the same forward.
+`compute_dtype` (fp16) carries every GEMM and the attention; `accum_dtype`
+(fp32) carries the residual stream and every LayerNorm. Each sublayer's fp16
+result is added into the fp32 residual by type promotion — one kernel, no
+intermediate cast — so rounding is absorbed by the accumulator instead of
+compounding from one layer into the next. That is the whole difference between
+the mixed path (0.90–1.88e-3) and fp16 everywhere (6–8e-3). `fp16/fp32-acc` in
+the results table denotes this pairing.
+
+Choosing *between* them is a fallback, with two gates. Per shape, calibration
+times an all-fp32 stack against the mixed stack and adopts fp16 only if it is
+both accurate enough and faster:
+
+- **accuracy** — `|r16 − r32| + TF32 noise ≤ 1.15 × atol`. The module never sees
+  the reference, so it bounds the error by triangulation rather than measuring it.
+- **speed** — fp16 must beat fp32 by more than 2%.
+
+fp32 is used if either gate fails, and the log distinguishes the two cases.
+
+**Shapes #3 and #4 use fp32, and the reason is speed, not accuracy.** fp16's
+error bound was 1.65e-3 against a 2.0e-3 budget on both — comfortably inside it
+— but fp16 measured slower: 0.946 against 0.729 ms on #3, and 1.967 against
+1.375 ms on #4. The partition is not monotonic in any shape parameter: B=1
+adopts fp16, B=4 and B=16 do not, B=64 and above do again. No hand-written
+threshold reproduces that.
+
+
 ## 5. Ablation study — what the fusions are worth
 
 Measured on the shipping code. Modes are **interleaved per shape** rather than
 run as two separate sweeps: GPU clocks drift over a multi-minute run, so two
 sequential passes would hand an advantage to whichever ran on the cooler card.
-60 repeats x 2 rounds per configuration. Shapes #6 (~11 min per run) and #14 (no
-runnable reference) are excluded.
+60 repeats x 2 rounds per configuration. Only #14 is excluded, for having no runnable
+reference; #6 uses 30 repeats over five runs per mode rather than 60 x 2.
 
 | Shape | Fusion on (ms) | Fusion off (ms) | Gain |
 |---|---|---|---|
@@ -214,6 +250,7 @@ runnable reference) are excluded.
 | 3 | 0.2099 | 0.2345 | 1.12x |
 | 4 | 0.3779 | 0.4485 | 1.19x † |
 | 5 | 0.6431 | 1.1141 | 1.73x |
+| 6 | 62.9612 | 87.7768 | 1.39x ‡ |
 | 7 | 0.1956 | 0.3881 | 1.98x |
 | 8 | 8.0865 | 9.1116 | 1.13x |
 | 9 | 0.5222 | 0.8284 | 1.59x |
@@ -221,10 +258,13 @@ runnable reference) are excluded.
 | 11 | 0.5294 | 0.7839 | 1.48x |
 | 12 | 0.3702 | 0.4710 | 1.27x |
 | 13 | 4.6935 | 6.5684 | 1.40x |
-| **Total** | **16.444** | **21.612** | **1.31x** |
+| **Geometric mean** | — | — | **1.52x** |
 
-**The fusions are worth 1.31x**, and win on **12 of 12** shapes. Accuracy PASS in
-every run of both configurations.
+**The fusions are worth 1.52x by geometric mean**, and win on **all 13**
+comparable shapes. Accuracy PASS in every run of both configurations. The
+summed-time ratio is 1.38x, but that figure is dominated by shape #6, which
+alone is 80% of the total; the geometric mean weights each shape equally and is
+the statistic the headline speedup also uses.
 
 † Shape #4 required re-measurement. A single sample put it at 0.78x — fusion
 *slower* — contradicting two other measurements. Five runs per mode resolved it:
@@ -267,7 +307,7 @@ sabotaged kernel (wrong `eps`, and a 1% scale error).
 The fusions originally had to prove themselves >2% faster before being adopted.
 A five-mode ablation over the same 12 shapes showed the gate was losing
 throughput: forcing the fusions on totalled 16.687 ms against 17.834 ms under
-the gate and 21.468 ms with fusion off. Forcing beat fusion-off on **12 of 12
+the gate and 21.468 ms with fusion off. Forcing beat fusion-off on **all 12 shapes of that subset
 shapes**, so no rejection the gate made was ever the right call — it was costing
 41–57% of the available speedup on shapes #1, #9, #10 and #12, and on #2, #9 and
 #12 the "measured" choice landed *below* the unfused path it was meant to be
@@ -286,7 +326,7 @@ fused is 18% slower (1.09 vs 0.92 ms) while the captured end-to-end result says
 34% faster (0.48 vs 0.73 ms). Both numbers are real; they answer different
 questions, and the gate was consulting the wrong one. Gating on a non-predictive
 proxy is worse than not gating, so the gate was removed rather than retuned.
-Section 4 reports the shipping result on the current code: **1.31x**.
+Section 5 reports the shipping result on the current code: **1.52x** by geometric mean across all 13 comparable shapes.
 
 **3. A regression introduced by fixing #2.**
 With the fusion always on, calibration began preferring graph capture for shape
