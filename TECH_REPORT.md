@@ -353,6 +353,26 @@ python run_all_shapes.py                        # 13/14 PASS, ~15 min
 python run_optimized_only.py --inplace-output   # shape #14
 ```
 
+Single shapes go through the benchmark script directly; the README lists all
+fourteen. Shape #14 needs three things together, and refuses with an explicit
+out-of-memory message if any one is missing:
+
+```bash
+TJ_INPLACE_OUTPUT=1 python torch_transformer_benchmark.py --batch-size 32 --d-model 1024 --heads 16 --seq-len 100000 --layers 2 --ffn-dim 1024 --causal --optimized-only --dtype float16
+```
+
+`--optimized-only` because the reference cannot be constructed; `float16`
+because at fp32 the input alone is 12.21 GiB against 11.99 GiB of VRAM; and
+`TJ_INPLACE_OUTPUT` because even at fp16 the input *plus* a separate output is
+12.21 GiB, while aliasing them needs one 6.10 GiB buffer. Measured this way:
+27478 ms, matching `run_optimized_only.py`.
+
+`run_optimized_only.py` remains preferable for #14: the environment variable
+overwrites the input, which the benchmark script reuses across timing
+iterations, so latency stays valid but the output after the first call is not
+meaningful. `run_optimized_only.py` calls the model once cleanly and reports
+whether the output is finite and correctly distributed.
+
 Every optimization is individually switchable for ablation — `TJ_DISABLE_FUSION`,
 `TJ_DISABLE_FUSED_NORM`, `TJ_DISABLE_GELU_EPILOGUE`, `TJ_DISABLE_SDPA`,
 `TJ_DISABLE_GRAPH`, `TJ_DISABLE_FUSED_QKV`, `TJ_DISABLE_ELISION`,

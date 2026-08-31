@@ -70,7 +70,7 @@ class UserOptimizedTransformer(OptimizedTransformerMixin, BaselineTransformer):
 | `fused_kernels.py` | Triton residual+LayerNorm+cast kernel, cuBLASLt GELU epilogue |
 | `torch_transformer_benchmark.py` | reference model, accuracy check, timing harness (see above) |
 | `run_all_shapes.py` | sweeps the official shapes, writes `sweep_logs/` |
-| `run_optimized_only.py` | runs one shape with no baseline, for shapes with no runnable reference |
+| `run_optimized_only.py` | runs any shape with no baseline constructed; defaults to #14, the shape that needs it |
 | `measure_bound_ratio.py` | measures the fp16 error bound that justifies the precision policy |
 | `TECH_REPORT.md` | environment, results, optimization catalogue, ablations |
 
@@ -105,6 +105,60 @@ pairs with.
 python run_all_shapes.py                        # full sweep -> sweep_logs/
 python run_optimized_only.py --inplace-output   # shape #14, no runnable reference
 ```
+
+`run_optimized_only.py` runs the optimized model on **any** shape with no
+baseline constructed; its defaults happen to be shape #14 because that is the
+shape that needs it. Pass `--batch-size`, `--seq-len` etc. to point it elsewhere.
+The sweep does not use it — `run_all_shapes.py` passes `--optimized-only` to the
+benchmark script instead.
+
+### Running one shape at a time
+
+Each official shape, directly through the benchmark script:
+
+```bash
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 1
+python torch_transformer_benchmark.py --batch-size 1     --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 2
+python torch_transformer_benchmark.py --batch-size 4     --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 3
+python torch_transformer_benchmark.py --batch-size 16    --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 4
+python torch_transformer_benchmark.py --batch-size 128   --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 5
+python torch_transformer_benchmark.py --batch-size 10000 --d-model 128  --heads 4  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 6  (~5 min)
+python torch_transformer_benchmark.py --batch-size 64    --d-model 32   --heads 4  --seq-len 128    --layers 4 --ffn-dim 32   --causal --warmup 100   # 7
+python torch_transformer_benchmark.py --batch-size 64    --d-model 1024 --heads 4  --seq-len 128    --layers 4 --ffn-dim 1024 --causal --warmup 100   # 8
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 1  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 9
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 2  --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 10
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 16 --seq-len 128    --layers 4 --ffn-dim 128  --causal --warmup 100   # 11
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 4  --seq-len 32     --layers 4 --ffn-dim 128  --causal --warmup 100   # 12
+python torch_transformer_benchmark.py --batch-size 64    --d-model 128  --heads 4  --seq-len 1024   --layers 4 --ffn-dim 128  --causal --warmup 100   # 13
+```
+
+#### Shape #14 needs three extra things
+
+```bash
+# Linux / macOS
+TJ_INPLACE_OUTPUT=1 python torch_transformer_benchmark.py --batch-size 32 --d-model 1024 --heads 16 --seq-len 100000 --layers 2 --ffn-dim 1024 --causal --optimized-only --dtype float16 --warmup 3 --repeats 10 --benchmark-rounds 1
+
+# PowerShell
+$env:TJ_INPLACE_OUTPUT=1; python torch_transformer_benchmark.py --batch-size 32 --d-model 1024 --heads 16 `
+    --seq-len 100000 --layers 2 --ffn-dim 1024 --causal --optimized-only --dtype float16 `
+    --warmup 3 --repeats 10 --benchmark-rounds 1
+```
+
+| flag | why |
+|---|---|
+| `--optimized-only` | the reference needs a 20 TB score tensor; it cannot be constructed, so no comparison is possible |
+| `--dtype float16` | at fp32 the input alone is 12.21 GiB against 11.99 GiB of VRAM |
+| `TJ_INPLACE_OUTPUT=1` | even at fp16, input **plus** output is 12.21 GiB. Aliasing them needs one buffer (6.10 GiB) |
+
+Drop any one of the three and it refuses with an out-of-memory message stating
+the arithmetic. Measured this way: **27478 ms**, matching `run_optimized_only.py`.
+
+**Prefer `run_optimized_only.py` for #14.** `TJ_INPLACE_OUTPUT` overwrites the
+input tensor, and the benchmark script reuses one input across every timing
+iteration — harmless for latency, since the shapes never change, but it means
+the output after the first call is not meaningful. `run_optimized_only.py` calls
+the model once cleanly first and reports whether the output is finite and
+correctly distributed, which is the actual evidence for that shape.
 
 The sweep takes roughly 15 minutes, most of it in shape #6 (B=10000), where the
 *reference* is the slow part. Expect **13/14 shapes PASS**.
