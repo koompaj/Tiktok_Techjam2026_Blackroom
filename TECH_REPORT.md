@@ -306,6 +306,14 @@ reference; #6 uses 30 repeats over five runs per mode rather than 60 x 2.
 | **Total** | **79.406** | **109.389** | **1.38x** |
 | **Geometric mean** | n/a | n/a | **1.52x** |
 
+The absolute times here are **not** comparable with the results table in
+Section 2. That sweep uses `--warmup 100` with 100 repeats over 3 rounds;
+this ablation uses 20 warmup with 60 repeats over 2 rounds, and precision,
+graph capture and fusion are all chosen by runtime calibration whose
+measurements depend on those counts. Shapes #4, #9 and #12 sit near the
+precision and capture decision boundaries, so they differ most (up to 91% on
+#12). Only the within-row ratio is meaningful here.
+
 **The fusions are worth 1.52x by geometric mean**, and win on **all 13**
 comparable shapes. Accuracy PASS in every run of both configurations. The
 summed-time ratio is 1.38x, but that figure is dominated by shape #6, which
@@ -353,8 +361,7 @@ sabotaged kernel (wrong `eps`, and a 1% scale error).
 The fusions originally had to prove themselves >2% faster before being adopted.
 A five-mode ablation over the same 12 shapes showed the gate was losing
 throughput: forcing the fusions on totalled 16.687 ms against 17.834 ms under
-the gate and 21.468 ms with fusion off. Forcing beat fusion-off on **all 12 shapes of that subset
-shapes**, so no rejection the gate made was ever the right call — it was costing
+the gate and 21.468 ms with fusion off. Forcing beat fusion-off on **all 12 shapes of that subset**, so no rejection the gate made was ever the right call — it was costing
 41–57% of the available speedup on shapes #1, #9, #10 and #12, and on #2, #9 and
 #12 the "measured" choice landed *below* the unfused path it was meant to be
 protecting.
@@ -395,7 +402,7 @@ fixes were themselves wrong on the first attempt and were caught by re-measuring
 ## 7. Reproducing
 
 ```bash
-python run_all_shapes.py                        # 13/14 PASS, ~15 min
+python run_all_shapes.py                        # 13/13 comparable PASS, ~15 min
 python run_optimized_only.py --inplace-output   # shape #14
 ```
 
@@ -424,4 +431,22 @@ Every optimization is individually switchable for ablation — `TJ_DISABLE_FUSIO
 `TJ_DISABLE_GRAPH`, `TJ_DISABLE_FUSED_QKV`, `TJ_DISABLE_ELISION`,
 `TJ_PRECISION`. Full list at the top of `optimized_transformer.py`.
 
-Limitations and future work: see [README.md](README.md).
+## 8. Limitations
+
+- **Shape #14 is not a throughput result.** Peak allocation is 12.23 GiB against
+  11.99 GiB of VRAM, so part of the working set pages over PCIe. Reported as
+  "runs correctly", never as a latency figure.
+- **The fp16 margin is thin.** Shape #7 consumes 94% of the absolute error
+  budget (1.88e-3 against 2.0e-3). A tighter tolerance would push several shapes
+  back to fp32 and forfeit most of their speedup.
+- **Calibration measures the eager path** while roughly half the suite runs under
+  graph capture. We removed the fusion speed gate rather than making the
+  measurement predictive; calibrating under capture is the correct fix.
+- **Attention itself is untouched.** We rely on PyTorch's SDPA. Section 6 shows
+  attention is only 2% of shape #8's FLOPs, so the headroom is in fusing the
+  output projection and residual add into the FlashAttention epilogue, which
+  SDPA's fixed epilogue does not allow.
+- **Single-GPU validation**, and a multi-stream slice path was implemented then
+  removed because it was never benchmarked.
+
+Full discussion: [README.md](README.md).

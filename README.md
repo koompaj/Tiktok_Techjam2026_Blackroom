@@ -37,7 +37,8 @@ Exactly what differs from the official script:
 |---|---|
 | line 29 | `from optimized_transformer import OptimizedTransformerMixin` |
 | the "Optimized implementation" section | `UserOptimizedTransformer` defined as `(OptimizedTransformerMixin, BaselineTransformer)` instead of an inline stub |
-| `parse_args()` | added `--optimized-only`, `--benchmark-on-failure`, `--non-strict-weight-copy` |
+| `parse_args()` | added `--optimized-only` (its help text is ours; the other flags are the official script's) |
+| the "Optimized implementation" comment block | rewritten to describe the mixin |
 | `benchmark_models()` | handles `baseline=None` for `--optimized-only` |
 
 **Deliberately unchanged**, because they define the grading:
@@ -161,7 +162,8 @@ the model once cleanly first and reports whether the output is finite and
 correctly distributed, which is the actual evidence for that shape.
 
 The sweep takes roughly 15 minutes, most of it in shape #6 (B=10000), where the
-*reference* is the slow part. Expect **13/14 shapes PASS**.
+*reference* is the slow part. Expect **13/13 comparable shapes PASS**; #14 has
+no runnable reference and is reported separately.
 
 Shape #14 (B=32, S=100000) is run separately and cannot appear in the main table.
 Its reference would need an explicit `[B, H, S, S]` score tensor of

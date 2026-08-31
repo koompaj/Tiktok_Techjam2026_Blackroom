@@ -1602,26 +1602,32 @@ class OptimizedTransformerMixin:
         reference: torch.Tensor,
         unfused_ms: float,
     ) -> Tuple[bool, float]:
-        """Is the fused path both faithful and faster on this shape?
+        """Is the fused path faithful on this shape? Speed is not asked.
 
-        Returns `(adopt, wall_ms)`, where `wall_ms` is the timing of whichever
-        path won -- the caller feeds it to `_capture_pays`, which must compare
-        graph replay against the path that will actually run.
+        Returns `(adopt, wall_ms)`, where `wall_ms` times the fused path -- the
+        caller feeds it to `_capture_pays`, which must compare graph replay
+        against the path that will actually run.
 
-        Two gates, in the order that makes the cheap one first:
+        **One gate, not two.** The fused result is compared against the unfused
+        one computed moments earlier on the same input and the same weights.
+        This is not an accuracy trade -- both paths compute the same mathematics
+        with fp32 statistics, so they should differ only by reduction order. The
+        gate is sized to catch a wrong kernel, not to license a lossy one; see
+        `_FUSION_DIFF_FRACTION`.
 
-        * **Faithful.** The fused result is compared against the unfused one
-          computed moments earlier on the same input and the same weights.
-          This is not an accuracy trade -- both paths compute the same
-          mathematics with fp32 statistics, so they should differ only by
-          reduction order, ~1e-6 over the whole stack. The gate is sized to
-          catch a wrong kernel, not to license a lossy one; see
-          `_FUSION_DIFF_FRACTION`.
-
-        * **Faster.** By more than run-to-run jitter. The fusions remove memory
-          traffic and launches, so on a shape whose time is dominated by large
-          GEMMs there may be nothing left for them to save, and carrying a
-          second code path for a tie is not worth it.
+        There used to be a second gate requiring the fusion to measure faster.
+        It was removed, and the reasoning is worth keeping because the same trap
+        is easy to fall back into: it timed the *eager* fused and unfused paths,
+        while roughly half the suite goes on to run under CUDA-graph capture,
+        where the launch overhead the fusion removes has already been
+        eliminated. On shape #9 the eager comparison called the fused path 18%
+        slower while the captured end-to-end result was 34% faster. Both
+        measurements were correct; they answered different questions, and the
+        gate was consulting the wrong one. Gating on a non-predictive proxy is
+        worse than not gating, so the gate is gone rather than retuned. The
+        ablation behind that: forcing the fusions on beat leaving them off on
+        all twelve shapes measured, while the gate itself gave up 41-57% of the
+        available speedup on four of them.
 
         Note the precision decision above was measured with fusion off on both
         candidates, so that comparison is internally consistent; fusion is then
