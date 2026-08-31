@@ -94,6 +94,24 @@ VRAM — fp32 does not fit even aliased. Only fp16 does, which is why
 are independent under attention and each slice is fully consumed before being
 overwritten; it is opt-in because it destroys the caller's input.
 
+The aliasing itself is one line. The sliced path normally allocates a second
+full-size buffer to write results into; with the flag it writes into the input:
+
+```python
+output = x if inplace else torch.empty_like(x)
+while start < batch:
+    stop = min(batch, start + slice_size)
+    output[start:stop] = forward_slice(x[start:stop], ...)
+```
+
+The write on the last line happens either way, so aliasing **adds no work** — it
+only skips an allocation, 6.10 GiB at fp16 on this shape. It is safe for two
+reasons. *Within* a slice, `forward_slice` computes the rows completely into its
+own buffers and returns a new tensor before anything is written back, never
+writing through the view it was handed. *Across* slices, attention runs within a
+sequence and never across the batch, so a slice's result does not depend on
+other rows, and each slice writes only the rows no later slice will read.
+
 This is also why `run_all_shapes.py` reports #14 as OOM: the sweep runs fp32,
 where the shape genuinely does not fit. That refusal is the preflight check
 working, not a failure of the optimized path.
