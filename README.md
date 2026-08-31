@@ -220,10 +220,12 @@ speedup.
 independent batch slices concurrently. It was plausible but never benchmarked,
 and we judged an untested concurrency path worse than no path at all.
 
-**Not attempted:** a fully fused attention kernel. We rely on PyTorch's SDPA,
-which reaches FlashAttention, rather than writing our own — the right call under
-time pressure, but a hand-written kernel specialized to these shapes is where
-remaining headroom most likely sits.
+**Not attempted:** a hand-written attention kernel. We rely on PyTorch's SDPA,
+which reaches FlashAttention. A Triton kernel could go further than SDPA can:
+its epilogue is fixed, so the output projection and the residual add must each
+be a separate pass over the `[B, S, d]` activation. Fusing them into the
+FlashAttention epilogue would remove an HBM round-trip per layer, which is where
+we would look for the next increment.
 
 ## Team contributions
 
