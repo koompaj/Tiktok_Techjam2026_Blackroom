@@ -20,7 +20,20 @@ Correctness contract, enforced per output element by the harness:
 abs(user - ref) <= 0.002   OR   abs(user - ref) <= 0.02 * abs(ref)
 ```
 
-Results, environment and the optimization catalogue: **[TECH_REPORT.md](TECH_REPORT.md)**
+## Results
+
+| | |
+|---|---|
+| **Geometric-mean speedup** | **10.014x** across the 13 shapes with a runnable reference |
+| Range | 2.707x (#8, GEMM-bound) to 35.179x (#13, long sequence) |
+| Accuracy | **13/13 comparable shapes PASS** under the contract above |
+| Shape #14 | Runs and produces correct output where the reference cannot exist at all — its baseline needs a 20 TB attention-score tensor |
+| Operator fusion alone | 1.52x by geometric mean, winning on all 13 shapes |
+| Hardware | RTX 4080 Laptop GPU (Ada, sm_89), 11.99 GiB |
+
+Per-shape numbers, the environment, the optimization catalogue, ablations and
+the derived hardware-utilization figures are in
+**[TECH_REPORT.md](TECH_REPORT.md)**.
 
 ---
 
