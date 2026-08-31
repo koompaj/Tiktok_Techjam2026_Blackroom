@@ -273,15 +273,22 @@ def main():
             row["fusion"],
         ))
 
-    # NO-REF shapes are excluded from the accuracy tally rather than counted as
-    # failures: nothing was compared, so neither a pass nor a fail is claimable.
-    comparable = [row for row in rows if row["status"] != "NO-REF"]
-    no_ref = len(rows) - len(comparable)
+    # Shapes with no runnable reference are excluded from the accuracy tally
+    # whatever becomes of them -- not only when they finish. Nothing was
+    # compared either way, so neither a pass nor a fail is claimable, and an OOM
+    # here is a memory fact about the shape rather than an accuracy result.
+    # Keying this off the shape number rather than the status is what keeps an
+    # OOM from being counted as a failed comparison that never happened.
+    comparable = [row for row in rows if row["number"] not in NO_BASELINE]
+    no_ref_rows = [row for row in rows if row["number"] in NO_BASELINE]
     passed = sum(1 for row in comparable if row["status"] == "PASS")
-    print("\naccuracy: %d/%d passed" % (passed, len(comparable)))
-    if no_ref:
-        print("          %d shape(s) ran without a runnable reference (NO-REF)"
-              % no_ref)
+    print("\naccuracy: %d/%d passed (shapes with a runnable reference)"
+          % (passed, len(comparable)))
+    for row in no_ref_rows:
+        # Named individually rather than counted, so an OOM stays visible
+        # instead of disappearing into a tally it is excluded from.
+        print("          #%-2d no runnable reference -> %s"
+              % (row["number"], row["status"]))
     if speedups:
         print("speedup : min=%.3fx  max=%.3fx  geomean=%.3fx  (%d timed shapes)" % (
             min(speedups), max(speedups), geomean(speedups), len(speedups)
