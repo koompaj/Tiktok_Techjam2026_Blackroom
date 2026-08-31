@@ -303,7 +303,8 @@ reference; #6 uses 30 repeats over five runs per mode rather than 60 x 2.
 | 11 | 0.5294 | 0.7839 | 1.48x |
 | 12 | 0.3702 | 0.4710 | 1.27x |
 | 13 | 4.6935 | 6.5684 | 1.40x |
-| **Geometric mean** | — | — | **1.52x** |
+| **Total** | **79.406** | **109.389** | **1.38x** |
+| **Geometric mean** | n/a | n/a | **1.52x** |
 
 **The fusions are worth 1.52x by geometric mean**, and win on **all 13**
 comparable shapes. Accuracy PASS in every run of both configurations. The
