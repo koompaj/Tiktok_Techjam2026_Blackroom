@@ -116,6 +116,32 @@ This is also why `run_all_shapes.py` reports #14 as OOM: the sweep runs fp32,
 where the shape genuinely does not fit. That refusal is the preflight check
 working, not a failure of the optimized path.
 
+### Hardware utilization
+
+Speedup against a reference says how much waste was removed, not how close the
+result is to what the hardware can do. Both figures below are **derived** from
+measured latency plus a counted FLOP or byte model, not measured directly.
+
+**Shape #6 — memory-bound.** Counting every activation pass through the four
+layers (fp32 residual reads and writes, fp16 narrowed activations, the fused QKV
+tensor, the FFN intermediates) gives ~30.1 GB of traffic per forward. Against
+the measured 58.561 ms that is **515 GB/s**, on a part whose DRAM peak is
+432 GB/s (192-bit GDDR6 at 18 Gbps).
+
+Exceeding DRAM peak is not an error in the model — it *is* the result. The model
+counts every pass as though it reached memory, so a figure above peak means a
+substantial share demonstrably did not: it was served from L2. That is exactly
+what slice-through-the-stack exists to achieve.
+
+**Shape #8 — GEMM-bound.** Its four layers total 420.9 GFLOP — QKV 49%, FFN 33%,
+output projection 16%, attention itself only 2%, which is why the fusions are
+worth just 1.13x there. Against the measured 8.093 ms that is **52.0 TFLOPS**
+of fp16 throughput; sustaining above 50 TFLOPS is not reachable through the fp32
+shader path on a part of this class, so the figure is itself evidence the
+tensor-core path is engaged. We quote no utilization percentage: peak tensor
+throughput on laptop parts is TGP-dependent, and a denominator we cannot verify
+would be worse than none.
+
 ---
 
 ## 3. Problem analysis: where the reference loses time
@@ -251,33 +277,6 @@ error bound was 1.65e-3 against a 2.0e-3 budget on both — comfortably inside i
 1.375 ms on #4. The partition is not monotonic in any shape parameter: B=1
 adopts fp16, B=4 and B=16 do not, B=64 and above do again. No hand-written
 threshold reproduces that.
-
-
-### Hardware utilization
-
-Speedup against a reference says how much waste was removed, not how close the
-result is to what the hardware can do. Both figures below are **derived** from
-measured latency plus a counted FLOP or byte model, not measured directly.
-
-**Shape #6 — memory-bound.** Counting every activation pass through the four
-layers (fp32 residual reads and writes, fp16 narrowed activations, the fused QKV
-tensor, the FFN intermediates) gives ~30.1 GB of traffic per forward. Against
-the measured 58.561 ms that is **515 GB/s**, on a part whose DRAM peak is
-432 GB/s (192-bit GDDR6 at 18 Gbps).
-
-Exceeding DRAM peak is not an error in the model — it *is* the result. The model
-counts every pass as though it reached memory, so a figure above peak means a
-substantial share demonstrably did not: it was served from L2. That is exactly
-what slice-through-the-stack exists to achieve.
-
-**Shape #8 — GEMM-bound.** Its four layers total 420.9 GFLOP — QKV 49%, FFN 33%,
-output projection 16%, attention itself only 2%, which is why the fusions are
-worth just 1.13x there. Against the measured 8.093 ms that is **52.0 TFLOPS**
-of fp16 throughput; sustaining above 50 TFLOPS is not reachable through the fp32
-shader path on a part of this class, so the figure is itself evidence the
-tensor-core path is engaged. We quote no utilization percentage: peak tensor
-throughput on laptop parts is TGP-dependent, and a denominator we cannot verify
-would be worse than none.
 
 
 ## 5. Ablation study — what the fusions are worth
@@ -442,7 +441,7 @@ Every optimization is individually switchable for ablation — `TJ_DISABLE_FUSIO
 - **Calibration measures the eager path** while roughly half the suite runs under
   graph capture. We removed the fusion speed gate rather than making the
   measurement predictive; calibrating under capture is the correct fix.
-- **Attention itself is untouched.** We rely on PyTorch's SDPA. Section 6 shows
+- **Attention itself is untouched.** We rely on PyTorch's SDPA. Section 2 shows
   attention is only 2% of shape #8's FLOPs, so the headroom is in fusing the
   output projection and residual add into the FlashAttention epilogue, which
   SDPA's fixed epilogue does not allow.
