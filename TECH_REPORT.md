@@ -57,6 +57,7 @@ alternating measurement order.
 | 11 | 64, 128, 16, 128, 4, 128 | PASS | **20.933x** | 11.125 | 0.531 | cuda-graph x1 | fp16/fp32-acc | norm+gelu |
 | 12 | 64, 128, 4, 32, 4, 128 | PASS | **12.629x** | 2.444 | 0.194 | cuda-graph x1 | fp16/fp32-acc | norm+gelu |
 | 13 | 64, 128, 4, 1024, 4, 128 | PASS | **35.179x** | 165.528 | 4.705 | eager x4 | fp16/fp32-acc | norm+gelu |
+| 14 | 32, 1024, 16, 100000, 2, 1024 | *no runnable reference* | — | — | — | eager x32 | fp16 | norm+gelu |
 
 **13 / 13 comparable shapes PASS.**
 **Geometric mean speedup 10.014x**, min 2.707x (#8), max 35.179x (#13).
